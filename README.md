@@ -32,6 +32,8 @@ url = "domain.com"
 key = "abc123"
 ```
 
+If the file is missing, `cc-store` creates a starter config with empty `url` and `key` values and tells you where it wrote it.
+
 ## Usage
 
 ```bash

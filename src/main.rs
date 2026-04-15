@@ -56,6 +56,21 @@ fn read_config() -> Result<Config> {
         .join("cc-store")
         .join("config.toml");
 
+    if !config_path.exists() {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create config directory at {}", parent.display()))?;
+        }
+
+        std::fs::write(&config_path, "url = \"\"\nkey = \"\"\n")
+            .with_context(|| format!("failed to create starter config at {}", config_path.display()))?;
+
+        bail!(
+            "no config file was found, so a starter file was created at {}. fill in url and key, then run cc-store again",
+            config_path.display()
+        );
+    }
+
     let raw = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config file at {}", config_path.display()))?;
 
