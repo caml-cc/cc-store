@@ -44,5 +44,9 @@ cc-store delete {id} # deletes a file using the id
 
 `cc-store get` writes to stdout when redirected. If run in a terminal, it saves the file locally without overwriting existing files.
 
+## Tab completion
+
+The install script automatically installs completion files for zsh, bash, and fish.
+
 ## Related projects
 [fs](https://github.com/caml-cc/fs.git) a self-hosted file upload API.

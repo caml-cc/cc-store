@@ -4,7 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use reqwest::header::CONTENT_DISPOSITION;
 use reqwest::{multipart, Client};
 use serde::Deserialize;
@@ -22,6 +23,8 @@ struct Cli {
 enum Command {
     Get { id: String },
     Delete { id: String },
+    #[command(hide = true)]
+    Completion { shell: Shell },
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +36,11 @@ struct Config {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Command::Completion { shell }) = &cli.command {
+        return print_completion_script(shell.clone());
+    }
+
     let config = read_config()?;
     let base_url = normalize_base_url(&config.url);
     let client = Client::new();
@@ -46,6 +54,12 @@ async fn main() -> Result<()> {
         ),
         _ => bail!("provide either a file to upload or a subcommand"),
     }
+}
+
+fn print_completion_script(shell: Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "cc-store", &mut std::io::stdout());
+    Ok(())
 }
 
 fn read_config() -> Result<Config> {
