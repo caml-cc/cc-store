@@ -14,13 +14,13 @@ use serde::Deserialize;
 #[command(name = "cc-store", about = "Upload and download files via your configured API")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
-
-    file: Option<PathBuf>,
+    command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    Upload { file: PathBuf },
+    List,
     Get { id: String },
     Delete { id: String },
     #[command(hide = true)]
@@ -37,7 +37,7 @@ struct Config {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(Command::Completion { shell }) = &cli.command {
+    if let Command::Completion { shell } = &cli.command {
         return print_completion_script(shell.clone());
     }
 
@@ -45,14 +45,12 @@ async fn main() -> Result<()> {
     let base_url = normalize_base_url(&config.url);
     let client = Client::new();
 
-    match (cli.command, cli.file) {
-        (Some(Command::Get { id }), None) => download_file(&client, &base_url, &id).await,
-        (Some(Command::Delete { id }), None) => delete_file(&client, &base_url, &config.key, &id).await,
-        (None, Some(path)) => upload_file(&client, &base_url, &config.key, &path).await,
-        (None, None) => bail!(
-            "usage:\n  cc-store <file>\n  cc-store get <id>\n  cc-store delete <id>"
-        ),
-        _ => bail!("provide either a file to upload or a subcommand"),
+    match cli.command {
+        Command::Upload { file } => upload_file(&client, &base_url, &config.key, &file).await,
+        Command::List => list_files(&client, &base_url, &config.key).await,
+        Command::Get { id } => download_file(&client, &base_url, &id).await,
+        Command::Delete { id } => delete_file(&client, &base_url, &config.key, &id).await,
+        Command::Completion { .. } => unreachable!("handled above"),
     }
 }
 
@@ -137,6 +135,28 @@ async fn upload_file(client: &Client, base_url: &str, api_key: &str, path: &Path
 
     if status != reqwest::StatusCode::CREATED {
         bail!("upload failed ({status}): {}", body.trim());
+    }
+
+    println!("{}", body.trim());
+    Ok(())
+}
+
+async fn list_files(client: &Client, base_url: &str, api_key: &str) -> Result<()> {
+    let response = client
+        .request(
+            reqwest::Method::from_bytes(b"LIST").context("invalid LIST method")?,
+            format!("{base_url}/"),
+        )
+        .header("K", api_key)
+        .send()
+        .await
+        .context("list request failed")?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        bail!("list failed ({status}): {}", body.trim());
     }
 
     println!("{}", body.trim());

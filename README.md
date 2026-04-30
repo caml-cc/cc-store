@@ -37,7 +37,8 @@ If the file is missing, `cc-store` creates a starter config with empty `url` and
 ## Usage
 
 ```bash
-cc-store file.txt # uploads the file and returns a url
+cc-store upload file.txt # uploads the file and returns a url
+cc-store list # lists files using the LIST request method
 cc-store get {id} # downloads a file using the id
 cc-store delete {id} # deletes a file using the id
 ```
