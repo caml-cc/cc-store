@@ -2,6 +2,7 @@ use std::env;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -19,7 +20,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Upload { file: PathBuf },
+    Upload {
+        file: PathBuf,
+        #[arg(short = 'k', long = "keep", value_name = "DURATION", value_parser = parse_duration)]
+        keep: Option<Duration>,
+    },
     List,
     Get { id: String },
     Delete { id: String },
@@ -46,7 +51,7 @@ async fn main() -> Result<()> {
     let client = Client::new();
 
     match cli.command {
-        Command::Upload { file } => upload_file(&client, &base_url, &config.key, &file).await,
+        Command::Upload { file, keep } => upload_file(&client, &base_url, &config.key, &file, keep).await,
         Command::List => list_files(&client, &base_url, &config.key).await,
         Command::Get { id } => download_file(&client, &base_url, &id).await,
         Command::Delete { id } => delete_file(&client, &base_url, &config.key, &id).await,
@@ -108,7 +113,13 @@ fn normalize_base_url(raw_url: &str) -> String {
     }
 }
 
-async fn upload_file(client: &Client, base_url: &str, api_key: &str, path: &Path) -> Result<()> {
+async fn upload_file(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    path: &Path,
+    keep: Option<Duration>,
+) -> Result<()> {
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("failed to read file {}", path.display()))?;
@@ -120,7 +131,11 @@ async fn upload_file(client: &Client, base_url: &str, api_key: &str, path: &Path
         .into_owned();
 
     let part = multipart::Part::bytes(bytes).file_name(file_name);
-    let form = multipart::Form::new().part("file", part);
+    let mut form = multipart::Form::new().part("file", part);
+
+    if let Some(keep) = keep {
+        form = form.text("keep", format!("{}s", keep.as_secs()));
+    }
 
     let response = client
         .post(format!("{base_url}/"))
@@ -139,6 +154,10 @@ async fn upload_file(client: &Client, base_url: &str, api_key: &str, path: &Path
 
     println!("{}", body.trim());
     Ok(())
+}
+
+fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
+    humantime::parse_duration(value).map_err(|error| error.to_string())
 }
 
 async fn list_files(client: &Client, base_url: &str, api_key: &str) -> Result<()> {
