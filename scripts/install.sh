@@ -19,6 +19,7 @@ fi
 REPO="https://github.com/caml-cc/cc-store.git"
 BIN_NAME="cc-store"
 TMP_DIR=$(mktemp -d)
+START_DIR=$(pwd)
 
 # Preferred install location
 SYSTEM_BIN="/usr/local/bin"
@@ -96,3 +97,6 @@ if [ ! -w "$SYSTEM_BIN" ]; then
     export PATH="$HOME/.local/bin:$PATH"'
     export PATH="$HOME/.local/bin:$PATH"
 fi
+
+cd "$START_DIR"
+rm -- "$0"
