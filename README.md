@@ -30,14 +30,16 @@ Create `$HOME/.config/caml/cc-store/config.toml`:
 ```toml
 url = "domain.com"
 key = "abc123"
+extract = false # set to true to unpack downloaded folders instead of keeping them as .tar.gz
 ```
 
-If the file is missing, `cc-store` creates a starter config with empty `url` and `key` values and tells you where it wrote it.
+If the file is missing, `cc-store` creates a starter config with empty `url` and `key` values and tells you where it wrote it. `extract` is optional and defaults to `false`.
 
 ## Usage
 
 ```bash
 cc-store upload file.txt # uploads the file and returns a url
+cc-store upload ./folder # packs the folder into folder.tar.gz and uploads it
 cc-store upload -k 100h file.txt # uploads the file and keeps it for 100 hours
 cc-store upload --keep=100h file.txt # same as above
 cc-store list # lists files using the LIST request method
@@ -46,6 +48,14 @@ cc-store delete {id} # deletes a file using the id
 ```
 
 `cc-store get` writes to stdout when redirected. If run in a terminal, it saves the file locally without overwriting existing files.
+
+### Large files
+
+Files and folders larger than the server's per-upload limit (`MAX_UPLOAD` on [fs](https://github.com/caml-cc/fs.git), 1GB by default) are split into fragments automatically and joined back together on the server, so they download as one file. Uploads and downloads are streamed, so they don't need to fit in memory. Failed fragments are retried up to 3 times.
+
+### Folders
+
+Uploading a folder packs it into a `.tar.gz` first. The archive is built in your temp directory (`$TMPDIR`, usually `/tmp`), so there needs to be enough room for it. By default `cc-store get` saves the folder as `folder.tar.gz`. With `extract = true` in the config, it unpacks it into `folder/` instead (or `folder-1/` and so on if that already exists).
 
 ## Tab completion
 
