@@ -53,6 +53,14 @@ cc-store delete {id} # deletes a file using the id
 
 Files and folders larger than the server's per-upload limit (`MAX_UPLOAD` on [fs](https://github.com/caml-cc/fs.git), 1GB by default) are split into fragments automatically and joined back together on the server, so they download as one file. Uploads and downloads are streamed, so they don't need to fit in memory. Failed fragments are retried up to 3 times.
 
+### Resuming uploads
+
+Every upload is hashed (BLAKE3) before it's sent, and the hash and upload id are saved in `~/.config/caml/cc-store/pending/<hash>.toml` until the upload finishes. If an upload is interrupted (Ctrl+C, a crash, lost connection), run the same `cc-store upload` command again. If the content is exactly the same, it continues where the server left off. If anything changed, it starts a new upload.
+
+- A resumed upload keeps the expiry from the first attempt, so a new `--keep` is ignored.
+- If the partial upload expired or was deleted on the server, a new upload starts automatically.
+- Folders resume too, as long as nothing inside them changed (they always pack to the same archive).
+
 ### Folders
 
 Uploading a folder packs it into a `.tar.gz` first. The archive is built in your temp directory (`$TMPDIR`, usually `/tmp`), so there needs to be enough room for it. By default `cc-store get` saves the folder as `folder.tar.gz`. With `extract = true` in the config, it unpacks it into `folder/` instead (or `folder-1/` and so on if that already exists).

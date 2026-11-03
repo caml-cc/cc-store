@@ -11,7 +11,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH};
 use reqwest::{Body, Client, Response, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
@@ -77,13 +77,19 @@ fn print_completion_script(shell: Shell) -> Result<()> {
     Ok(())
 }
 
+/// `~/.config/caml/cc-store`, using `USERPROFILE` as the home directory on
+/// systems without `$HOME` (Windows).
+fn config_dir() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .context("could not find your home directory ($HOME is not set)")?;
+
+    Ok(PathBuf::from(home).join(".config").join("caml").join("cc-store"))
+}
+
 fn read_config() -> Result<Config> {
-    let home = env::var("HOME").context("$HOME is not set")?;
-    let config_path = Path::new(&home)
-        .join(".config")
-        .join("caml")
-        .join("cc-store")
-        .join("config.toml");
+    let config_path = config_dir()?.join("config.toml");
 
     if !config_path.exists() {
         if let Some(parent) = config_path.parent() {
@@ -144,7 +150,7 @@ async fn upload_path(
             .unwrap_or_else(|| "folder".to_string());
 
         if std::io::stderr().is_terminal() {
-            eprintln!("packing {}/ ...", dir_name);
+            eprintln!("packing {dir_name}/ ...");
         }
 
         let source = path.to_path_buf();
@@ -152,23 +158,9 @@ async fn upload_path(
             .await
             .context("folder packing task failed")??;
 
-        let file = tokio::fs::File::open(archive.path())
-            .await
-            .context("failed to open packed folder")?;
-        let len = file.metadata().await?.len();
-
         // `archive` stays alive until the upload finishes, then the temp file is removed.
-        let result = upload_fragmented(
-            client,
-            base_url,
-            api_key,
-            file,
-            len,
-            &format!("{dir_name}.tar.gz"),
-            keep,
-            true,
-        )
-        .await;
+        let name = format!("{dir_name}.tar.gz");
+        let result = upload_source(client, base_url, api_key, archive.path(), &name, keep, true).await;
         drop(archive);
         return result;
     }
@@ -179,24 +171,24 @@ async fn upload_path(
         .to_string_lossy()
         .into_owned();
 
-    let file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("failed to open file {}", path.display()))?;
-
-    upload_fragmented(client, base_url, api_key, file, metadata.len(), &file_name, keep, false).await
+    upload_source(client, base_url, api_key, path, &file_name, keep, false).await
 }
 
 /// Packs a directory into a gzipped tarball in a temporary file. Entries are
-/// stored relative to the directory itself, without a top-level prefix.
+/// stored relative to the directory itself and added in sorted order, so an
+/// unchanged folder always packs to identical bytes (and the same hash), which
+/// lets interrupted folder uploads resume.
 fn pack_dir(dir: &Path) -> Result<NamedTempFile> {
     let tmp = NamedTempFile::new().context("failed to create temporary archive")?;
 
+    // GzEncoder::new writes a gzip header with mtime 0, so it is deterministic too.
     let encoder = GzEncoder::new(BufWriter::new(tmp.as_file()), Compression::default());
     let mut builder = tar::Builder::new(encoder);
     builder.follow_symlinks(false);
     builder
-        .append_dir_all(".", dir)
+        .append_dir(".", dir)
         .with_context(|| format!("failed to pack folder {}", dir.display()))?;
+    append_dir_sorted(&mut builder, dir, Path::new(""))?;
 
     let mut writer = builder
         .into_inner()
@@ -209,20 +201,184 @@ fn pack_dir(dir: &Path) -> Result<NamedTempFile> {
     Ok(tmp)
 }
 
-/// Uploads `file` using the server's fragment protocol: one `POST /fragment`
-/// to start, then one `PATCH /{id}` per fragment of at most the server's
-/// max upload size. Small files are simply sent as a single fragment.
+fn append_dir_sorted<W: Write>(builder: &mut tar::Builder<W>, dir: &Path, rel: &Path) -> Result<()> {
+    let mut entries = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read folder {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read folder {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let full = entry.path();
+        let name = rel.join(entry.file_name());
+
+        // For a directory this adds just its header; its contents follow below.
+        builder
+            .append_path_with_name(&full, &name)
+            .with_context(|| format!("failed to pack {}", full.display()))?;
+
+        // file_type() does not follow symlinks, so linked directories are stored as links.
+        if entry.file_type()?.is_dir() {
+            append_dir_sorted(builder, &full, &name)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Files at least this big get a "hashing ..." notice, since hashing them takes a moment.
+const HASH_NOTICE_BYTES: u64 = 100 << 20;
+
+/// A record of an upload that has started but not finished, stored as
+/// `<config dir>/pending/<blake3 hash>.toml` until the upload completes.
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingUpload {
+    id: String,
+    url: String,
+    name: String,
+    size: u64,
+    started: u64,
+}
+
+enum Resume {
+    /// No usable pending upload: start a new one.
+    Fresh,
+    /// The server already has every byte (the previous run died before cleaning up).
+    Complete(String),
+    /// Continue an existing upload from `offset`.
+    At { id: String, max_chunk: u64, offset: u64 },
+}
+
+/// Hashes the upload source, then either resumes a matching pending upload or
+/// starts a new one, and sends the remaining fragments.
 #[allow(clippy::too_many_arguments)]
-async fn upload_fragmented(
+async fn upload_source(
     client: &Client,
     base_url: &str,
     api_key: &str,
-    file: tokio::fs::File,
-    len: u64,
+    path: &Path,
     name: &str,
     keep: Option<Duration>,
     is_dir: bool,
 ) -> Result<()> {
+    let len = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .len();
+    let show_status = std::io::stderr().is_terminal();
+
+    if show_status && len >= HASH_NOTICE_BYTES {
+        eprintln!("hashing {name} ...");
+    }
+    let hash = hash_file(path.to_path_buf()).await?;
+
+    let (id, max_chunk, offset) = match check_pending(client, base_url, api_key, &hash, len).await? {
+        Resume::Complete(id) => {
+            remove_pending(&hash);
+            println!("{}/{id}", display_host(base_url));
+            return Ok(());
+        }
+        Resume::At { id, max_chunk, offset } => {
+            if keep.is_some() {
+                eprintln!("note: resuming an existing upload, so --keep is ignored (the original expiry still applies)");
+            }
+            if show_status {
+                let percent = (offset * 100).checked_div(len).unwrap_or(0);
+                eprintln!("resuming upload {id} at {percent}%");
+            }
+            (id, max_chunk, offset)
+        }
+        Resume::Fresh => {
+            let (id, max_chunk) = start_upload(client, base_url, api_key, len, name, keep, is_dir).await?;
+
+            let record = PendingUpload {
+                id: id.clone(),
+                url: base_url.to_string(),
+                name: name.to_string(),
+                size: len,
+                started: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+            };
+            if let Err(error) = save_pending(&hash, &record) {
+                eprintln!("warning: this upload can't be resumed if interrupted: {error:#}");
+            }
+
+            (id, max_chunk, 0)
+        }
+    };
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    send_fragments(client, base_url, api_key, file, len, &id, max_chunk, offset, &hash).await
+}
+
+/// Looks for a pending upload of this exact content and asks the server how
+/// much of it already arrived.
+async fn check_pending(client: &Client, base_url: &str, api_key: &str, hash: &str, len: u64) -> Result<Resume> {
+    let Some(record) = load_pending(hash) else {
+        return Ok(Resume::Fresh);
+    };
+
+    // A record for another server is left alone; starting fresh overwrites it.
+    if record.url != base_url {
+        return Ok(Resume::Fresh);
+    }
+    if record.size != len {
+        remove_pending(hash);
+        return Ok(Resume::Fresh);
+    }
+
+    let response = client
+        .head(format!("{base_url}/{}", record.id))
+        .header("K", api_key)
+        .send()
+        .await
+        .context("upload request failed")?;
+
+    match response.status() {
+        StatusCode::OK => {}
+        StatusCode::NOT_FOUND => {
+            // Expired or deleted on the server.
+            remove_pending(hash);
+            return Ok(Resume::Fresh);
+        }
+        status => bail!("upload failed ({status}) while checking for an interrupted upload"),
+    }
+
+    let length = header_u64(&response, "Upload-Length");
+    let offset = header_u64(&response, "Upload-Offset");
+    let max_chunk = header_u64(&response, "Upload-Max-Chunk").filter(|&n| n > 0);
+    let complete = header_str(&response, "Upload-Complete").as_deref() == Some("1");
+
+    match (length, offset, max_chunk) {
+        (Some(length), Some(_), Some(_)) if length == len && complete => Ok(Resume::Complete(record.id)),
+        (Some(length), Some(offset), Some(max_chunk)) if length == len && offset <= len => Ok(Resume::At {
+            id: record.id,
+            max_chunk,
+            offset,
+        }),
+        _ => {
+            remove_pending(hash);
+            Ok(Resume::Fresh)
+        }
+    }
+}
+
+/// `POST /fragment`: registers a new upload and returns its id and the
+/// server's max fragment size.
+async fn start_upload(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    len: u64,
+    name: &str,
+    keep: Option<Duration>,
+    is_dir: bool,
+) -> Result<(String, u64)> {
     let mut request = client
         .post(format!("{base_url}/fragment"))
         .header("K", api_key)
@@ -249,15 +405,30 @@ async fn upload_fragmented(
         .filter(|&n| n > 0)
         .ok_or_else(|| anyhow!("server did not return a valid max fragment size"))?;
 
+    Ok((id, max_chunk))
+}
+
+/// Sends `file` from `offset` onwards as `PATCH /{id}` fragments of at most
+/// `max_chunk` bytes. Small files are a single fragment.
+#[allow(clippy::too_many_arguments)]
+async fn send_fragments(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    file: tokio::fs::File,
+    len: u64,
+    id: &str,
+    max_chunk: u64,
+    mut offset: u64,
+    hash: &str,
+) -> Result<()> {
     let parts = len.div_ceil(max_chunk).max(1);
     let show_progress = parts > 1 && std::io::stderr().is_terminal();
-
-    let mut offset: u64 = 0;
     let mut failures: u32 = 0;
 
     loop {
         let chunk_len = max_chunk.min(len - offset);
-        let part = offset / max_chunk + 1;
+        let part = (offset / max_chunk + 1).min(parts);
         if show_progress {
             eprint!("\ruploading part {part}/{parts}");
         }
@@ -284,6 +455,7 @@ async fn upload_fragmented(
                     if show_progress {
                         eprintln!();
                     }
+                    remove_pending(hash);
                     let body = response.text().await.unwrap_or_default();
                     println!("{}", body.trim());
                     return Ok(());
@@ -310,6 +482,13 @@ async fn upload_fragmented(
                         bail!("upload failed (409 Conflict): {}", body.trim());
                     }
                 },
+                StatusCode::NOT_FOUND => {
+                    if show_progress {
+                        eprintln!();
+                    }
+                    remove_pending(hash);
+                    bail!("upload {id} no longer exists on the server (expired or deleted); run the command again to start over");
+                }
                 status if status.is_server_error() => {
                     let body = response.text().await.unwrap_or_default();
                     format!("{status}: {}", body.trim())
@@ -327,10 +506,61 @@ async fn upload_fragmented(
             if show_progress {
                 eprintln!();
             }
-            bail!("upload {id} failed after {MAX_RETRIES} retries: {error}");
+            bail!("upload interrupted after {MAX_RETRIES} retries ({error}); run the same command again to resume");
         }
         tokio::time::sleep(Duration::from_secs(u64::from(failures))).await;
     }
+}
+
+async fn hash_file(path: PathBuf) -> Result<String> {
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let file = std::fs::File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher
+            .update_reader(file)
+            .with_context(|| format!("failed to hash {}", path.display()))?;
+        Ok(hasher.finalize().to_hex().to_string())
+    })
+    .await
+    .context("hashing task failed")?
+}
+
+fn pending_path(hash: &str) -> Result<PathBuf> {
+    Ok(config_dir()?.join("pending").join(format!("{hash}.toml")))
+}
+
+fn load_pending(hash: &str) -> Option<PendingUpload> {
+    let raw = std::fs::read_to_string(pending_path(hash).ok()?).ok()?;
+    toml::from_str(&raw).ok()
+}
+
+fn save_pending(hash: &str, record: &PendingUpload) -> Result<()> {
+    let path = pending_path(hash)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    // Write then rename, so a crash never leaves a half-written record.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string(record)?)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_pending(hash: &str) {
+    if let Ok(path) = pending_path(hash) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The base URL without its scheme, matching how the server prints file URLs.
+fn display_host(base_url: &str) -> &str {
+    base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))
+        .unwrap_or(base_url)
 }
 
 fn header_str(response: &Response, name: &str) -> Option<String> {
